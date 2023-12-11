@@ -1,5 +1,5 @@
+use cosmic_text::{SubpixelBin, SwashImage};
 use fontdue::layout::{CoordinateSystem, Layout, LayoutSettings, TextStyle};
-use std::sync::Arc;
 
 mod path;
 use path::*;
@@ -27,8 +27,6 @@ pub mod atlas;
 mod glyphs;
 use glyphs::GlyphCache;
 
-use wgpu::util::DeviceExt;
-
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug)]
 struct Uniforms {
@@ -37,11 +35,6 @@ struct Uniforms {
 
 #[derive(Copy, Clone, Debug)]
 pub struct PaintIndex {
-    index: usize,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct ImageIndex {
     index: usize,
 }
 
@@ -71,11 +64,10 @@ impl Scissor {
 }
 
 pub struct Vger {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     scenes: [Scene; 3],
     cur_scene: usize,
     cur_layer: usize,
+    cur_z_index: i32,
     tx_stack: Vec<LocalToWorld>,
     scissor_stack: Vec<Scissor>,
     device_px_ratio: f32,
@@ -90,19 +82,11 @@ pub struct Vger {
     pen: LocalPoint,
     pub glyph_cache: GlyphCache,
     layout: Layout,
-    images: Vec<Option<wgpu::Texture>>,
-    image_bind_groups: Vec<Option<wgpu::BindGroup>>,
-    image_bind_group_layout: wgpu::BindGroupLayout,
-    default_image_bind_group: wgpu::BindGroup,
 }
 
 impl Vger {
     /// Create a new renderer given a device and output pixel format.
-    pub fn new(
-        device: Arc<wgpu::Device>,
-        queue: Arc<wgpu::Queue>,
-        texture_format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, texture_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -110,11 +94,7 @@ impl Vger {
             ))),
         });
 
-        let scenes = [
-            Scene::new(&device),
-            Scene::new(&device),
-            Scene::new(&device),
-        ];
+        let scenes = [Scene::new(device), Scene::new(device), Scene::new(device)];
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -142,6 +122,22 @@ impl Vger {
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -149,31 +145,26 @@ impl Vger {
                 label: Some("uniform_bind_group_layout"),
             });
 
-        let image_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                }],
-                label: Some("image_bind_group_layout"),
-            });
+        let glyph_cache = GlyphCache::new(device);
 
-        let glyph_cache = GlyphCache::new(&device);
+        let mask_texture_view = glyph_cache.mask_atlas.create_view();
+        let color_texture_view = glyph_cache.color_atlas.create_view();
 
-        let texture_view = glyph_cache.create_view();
-
-        let uniforms = GPUVec::new_uniforms(&device, "uniforms");
+        let uniforms = GPUVec::new_uniforms(device, "uniforms");
 
         let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("glyph"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let color_glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("color_glyph"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -183,31 +174,29 @@ impl Vger {
                 uniforms.bind_group_entry(0),
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                    resource: wgpu::BindingResource::TextureView(&mask_texture_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&color_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(&glyph_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&color_glyph_sampler),
                 },
             ],
             label: Some("vger bind group"),
         });
 
-        let default_image_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &image_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            }],
-            label: Some("vger default image bind group"),
-        });
-
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[
-                &Scene::bind_group_layout(&device),
+                &Scene::bind_group_layout(device),
                 &uniform_bind_group_layout,
-                &image_bind_group_layout,
             ],
             push_constant_ranges: &[],
         });
@@ -251,11 +240,10 @@ impl Vger {
         let layout = Layout::new(CoordinateSystem::PositiveYUp);
 
         Self {
-            device,
-            queue,
             scenes,
             cur_scene: 0,
             cur_layer: 0,
+            cur_z_index: 0,
             tx_stack: vec![],
             scissor_stack: vec![],
             device_px_ratio: 1.0,
@@ -270,10 +258,6 @@ impl Vger {
             pen: LocalPoint::zero(),
             glyph_cache,
             layout,
-            images: vec![],
-            image_bind_groups: vec![],
-            image_bind_group_layout,
-            default_image_bind_group,
         }
     }
 
@@ -294,6 +278,7 @@ impl Vger {
         self.scissor_stack.push(Scissor::new());
         self.paint_count = 0;
         self.xform_count = 0;
+        self.add_xform();
         self.scissor_count = 0;
         self.pen = LocalPoint::zero();
     }
@@ -311,12 +296,14 @@ impl Vger {
     }
 
     /// Encode all rendering to a command buffer.
-    pub fn encode(&mut self, render_pass: &wgpu::RenderPassDescriptor) {
-        let device = &self.device;
-        let queue = &self.queue;
+    pub fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        render_pass: &wgpu::RenderPassDescriptor,
+        queue: &wgpu::Queue,
+    ) {
         self.scenes[self.cur_scene].update(device, queue);
         self.uniforms.update(device, queue);
-        let mut current_texture = -1;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vger encoder"),
@@ -336,63 +323,24 @@ impl Vger {
             );
 
             rpass.set_bind_group(1, &self.uniform_bind_group, &[]);
-            rpass.set_bind_group(2, &self.default_image_bind_group, &[]);
 
-            let scene = &self.scenes[self.cur_scene];
-            let n = scene.prims[self.cur_layer].len();
-            let mut m: u32 = 0;
-            let mut start: u32 = 0;
+            let n = self.scenes[self.cur_scene].prims[self.cur_layer].len();
+            // println!("encoding {:?} prims", n);
 
-            for i in 0..n {
-                let prim = &scene.prims[self.cur_layer][i];
-                let image_id = scene.paints[prim.paint as usize].image;
-
-                // Image changed, render.
-                if image_id >= 0 && image_id != current_texture {
-                    // println!("image changed: encoding {:?} prims", m);
-                    if m > 0 {
-                        rpass.draw(
-                            /*vertices*/ 0..4,
-                            /*instances*/ start..(start + m),
-                        );
-                    }
-
-                    current_texture = image_id;
-                    rpass.set_bind_group(
-                        2,
-                        self.image_bind_groups[image_id as usize].as_ref().unwrap(),
-                        &[],
-                    );
-
-                    start += m;
-                    m = 0;
-                }
-
-                m += 1;
-            }
-
-            // println!("encoding {:?} prims", m);
-
-            if m > 0 {
-                rpass.draw(
-                    /*vertices*/ 0..4,
-                    /*instances*/ start..(start + m),
-                )
-            }
+            rpass.draw(/*vertices*/ 0..4, /*instances*/ 0..(n as u32))
         }
         queue.submit(Some(encoder.finish()));
 
         // If we're getting close to full, reset the glyph cache.
-        let usage = self.glyph_cache.usage();
-        // println!("glyph cache usage {}", usage);
-        if usage > 0.7 {
-            // println!("clearing glyph cache");
-            self.glyph_cache.clear();
-        }
+        self.glyph_cache.check_usage();
     }
 
     fn render(&mut self, prim: Prim) {
-        self.scenes[self.cur_scene].prims[self.cur_layer].push(prim);
+        let prims = self.scenes[self.cur_scene]
+            .depthed_prims
+            .entry(self.cur_z_index)
+            .or_default();
+        prims.push(prim);
     }
 
     /// Fills a circle.
@@ -411,7 +359,6 @@ impl Vger {
         prim.paint = paint_index.index as u32;
         prim.quad_bounds = [c.x - radius, c.y - radius, c.x + radius, c.y + radius];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -448,7 +395,6 @@ impl Vger {
             c.y + radius + width,
         ];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -474,7 +420,6 @@ impl Vger {
         prim.paint = paint_index.index as u32;
         prim.quad_bounds = [min.x, min.y, max.x, max.y];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -500,7 +445,6 @@ impl Vger {
         prim.paint = paint_index.index as u32;
         prim.quad_bounds = [min.x - width, min.y - width, max.x + width, max.y + width];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -525,13 +469,12 @@ impl Vger {
         prim.width = width;
         prim.paint = paint_index.index as u32;
         prim.quad_bounds = [
-            ap.x.min(bp.x) - width / 2.0,
-            ap.y.min(bp.y) - width / 2.0,
-            ap.x.max(bp.x) + width / 2.0,
-            ap.y.max(bp.y) + width / 2.0,
+            ap.x.min(bp.x) - width * 2.0,
+            ap.y.min(bp.y) - width * 2.0,
+            ap.x.max(bp.x) + width * 2.0,
+            ap.y.max(bp.y) + width * 2.0,
         ];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -566,7 +509,6 @@ impl Vger {
             ap.y.max(bp.y).max(cp.y) + width,
         ];
         prim.tex_bounds = prim.quad_bounds;
-        prim.xform = self.add_xform() as u32;
         prim.scissor = self.add_scissor() as u32;
 
         self.render(prim);
@@ -592,7 +534,6 @@ impl Vger {
 
     /// Fills a path.
     pub fn fill(&mut self, paint_index: PaintIndex) {
-        let xform = self.add_xform();
         let scissor = self.add_scissor();
 
         self.path_scanner.init();
@@ -601,7 +542,6 @@ impl Vger {
             let mut prim = Prim::default();
             prim.prim_type = PrimType::PathFill as u32;
             prim.paint = paint_index.index as u32;
-            prim.xform = xform as u32;
             prim.scissor = scissor as u32;
             prim.start = self.scenes[self.cur_scene].cvs.len() as u32;
 
@@ -631,6 +571,8 @@ impl Vger {
 
             self.render(prim);
         }
+
+        self.path_scanner.segments.clear();
     }
 
     fn setup_layout(&mut self, text: &str, size: u32, max_width: Option<f32>) {
@@ -649,6 +591,83 @@ impl Vger {
         );
     }
 
+    pub fn render_glyph<'a>(
+        &mut self,
+        x: f32,
+        y: f32,
+        font_id: cosmic_text::fontdb::ID,
+        glyph_id: u16,
+        size: u32,
+        subpx: (SubpixelBin, SubpixelBin),
+        image: impl FnOnce() -> SwashImage,
+        paint_index: PaintIndex,
+    ) {
+        let info = self
+            .glyph_cache
+            .get_glyph_mask(font_id, glyph_id, size, subpx, image);
+        if let Some(rect) = info.rect {
+            let mut prim = Prim::default();
+            prim.prim_type = if info.colored {
+                PrimType::ColorGlyph
+            } else {
+                PrimType::Glyph
+            } as u32;
+
+            let x = x + info.left as f32;
+            let y = y - info.top as f32;
+            prim.quad_bounds = [x, y, x + rect.width as f32, y + rect.height as f32];
+
+            prim.tex_bounds = [
+                rect.x as f32,
+                rect.y as f32,
+                (rect.x + rect.width) as f32,
+                (rect.y + rect.height) as f32,
+            ];
+            prim.paint = paint_index.index as u32;
+            prim.scissor = self.add_scissor() as u32;
+
+            self.render(prim);
+        }
+    }
+
+    pub fn render_svg(
+        &mut self,
+        x: f32,
+        y: f32,
+        hash: &[u8],
+        width: u32,
+        height: u32,
+        image: impl FnOnce() -> Vec<u8>,
+        paint_index: Option<PaintIndex>,
+    ) {
+        let info = self.glyph_cache.get_svg_mask(hash, width, height, image);
+        if let Some(rect) = info.rect {
+            let mut prim = Prim::default();
+            prim.prim_type = if paint_index.is_some() {
+                PrimType::OverrideColorSvg
+            } else {
+                PrimType::ColorGlyph
+            } as u32;
+
+            let x = x + info.left as f32;
+            let y = y - info.top as f32;
+            prim.quad_bounds = [x, y, x + rect.width as f32, y + rect.height as f32];
+
+            prim.tex_bounds = [
+                rect.x as f32,
+                rect.y as f32,
+                (rect.x + rect.width) as f32,
+                (rect.y + rect.height) as f32,
+            ];
+            if let Some(paint_index) = paint_index {
+                prim.paint = paint_index.index as u32;
+            }
+            prim.scissor = self.add_scissor() as u32;
+
+            self.render(prim);
+        }
+    }
+
     /// Renders text.
     pub fn text(&mut self, text: &str, size: u32, color: Color, max_width: Option<f32>) {
         self.setup_layout(text, size, max_width);
@@ -657,7 +676,6 @@ impl Vger {
         let scaled_size = size as f32 * scale;
 
         let paint = self.color_paint(color);
-        let xform = self.add_xform() as u32;
         let scissor = self.add_scissor() as u32;
 
         let mut prims = vec![];
@@ -669,7 +687,6 @@ impl Vger {
             if let Some(rect) = info.rect {
                 let mut prim = Prim::default();
                 prim.prim_type = PrimType::Glyph as u32;
-                prim.xform = xform;
                 prim.scissor = scissor;
                 assert!(glyph.width == rect.width as usize);
                 assert!(glyph.height == rect.height as usize);
@@ -768,7 +785,8 @@ impl Vger {
             for line in lines {
                 let mut rect = LocalRect::zero();
 
-                for glyph in &glyphs[line.glyph_start..line.glyph_end] {
+                for i in line.glyph_start..line.glyph_end {
+                    let glyph = glyphs[i];
                     rect = rect.union(&LocalRect::new(
                         [glyph.x, glyph.y].into(),
                         [glyph.width as f32, glyph.height as f32].into(),
@@ -848,6 +866,10 @@ impl Vger {
         }
     }
 
+    pub fn set_z_index(&mut self, z_index: i32) {
+        self.cur_z_index = z_index;
+    }
+
     /// Resets the current scissor rect.
     pub fn reset_scissor(&mut self) {
         if let Some(m) = self.scissor_stack.last_mut() {
@@ -888,93 +910,50 @@ impl Vger {
             glow,
         ))
     }
+}
 
-    /// Create an image from pixel data in memory.
-    /// Must be RGBA8.
-    pub fn create_image_pixels(&mut self, data: &[u8], width: u32, height: u32) -> ImageIndex {
-        let texture_size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+#[derive(Hash, Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum SubpixelOffset {
+    Zero = 0,
+    Quarter = 1,
+    Half = 2,
+    ThreeQuarters = 3,
+}
 
-        let texture_desc = wgpu::TextureDescriptor {
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            label: Some("lyte image"),
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-        };
+impl Default for SubpixelOffset {
+    fn default() -> Self {
+        SubpixelOffset::Zero
+    }
+}
 
-        let texture = self.device.create_texture(&texture_desc);
-
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp Buffer"),
-                contents: data,
-                usage: wgpu::BufferUsages::COPY_SRC,
-            });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("texture_buffer_copy_encoder"),
-            });
-
-        let image_size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
-                buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                aspect: wgpu::TextureAspect::All,
-                origin: wgpu::Origin3d::ZERO,
-            },
-            image_size,
-        );
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        let index = ImageIndex {
-            index: self.images.len(),
-        };
-
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        self.images.push(Some(texture));
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.image_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            }],
-            label: Some("vger bind group"),
-        });
-
-        self.image_bind_groups.push(Some(bind_group));
-
-        index
+impl SubpixelOffset {
+    // Skia quantizes subpixel offsets into 1/4 increments.
+    // Given the absolute position, return the quantized increment
+    pub fn quantize(pos: f32) -> Self {
+        // Following the conventions of Gecko and Skia, we want
+        // to quantize the subpixel position, such that abs(pos) gives:
+        // [0.0, 0.125) -> Zero
+        // [0.125, 0.375) -> Quarter
+        // [0.375, 0.625) -> Half
+        // [0.625, 0.875) -> ThreeQuarters,
+        // [0.875, 1.0) -> Zero
+        // The unit tests below check for this.
+        let apos = ((pos - pos.floor()) * 8.0) as i32;
+        match apos {
+            1..=2 => SubpixelOffset::Quarter,
+            3..=4 => SubpixelOffset::Half,
+            5..=6 => SubpixelOffset::ThreeQuarters,
+            _ => SubpixelOffset::Zero,
+        }
     }
 
-    pub fn delete_image(&mut self, image: ImageIndex) {
-        self.images[image.index] = None;
-        self.image_bind_groups[image.index] = None;
+    pub fn to_f32(self) -> f32 {
+        match self {
+            SubpixelOffset::Zero => 0.0,
+            SubpixelOffset::Quarter => 0.25,
+            SubpixelOffset::Half => 0.5,
+            SubpixelOffset::ThreeQuarters => 0.75,
+        }
     }
 }

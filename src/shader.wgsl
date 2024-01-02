@@ -508,10 +508,14 @@ struct VertexOutput {
 
     /// Point transformed by current transform.
     @location(2) p: vec2<f32>,
+
+    /// Screen size.
+    @location(3) size: vec2<f32>,
 };
 
 struct Uniforms {
     size: vec2<f32>,
+    atlas_size: vec2<f32>,
 };
 
 @group(1)
@@ -555,6 +559,7 @@ fn vs_main(
 
     out.p = (xforms.xforms[prim.xform] * vec4<f32>(q, 0.0, 1.0)).xy;
     out.position = vec4<f32>((2.0 * out.p / uniforms.size - 1.0) * vec2<f32>(1.0, -1.0), 0.0, 1.0);
+    out.size = uniforms.atlas_size;
 
     return out;
 }
@@ -599,6 +604,8 @@ struct Scissor {
     xform: PackedMat3x2,
     origin: vec2<f32>,
     size: vec2<f32>,
+    radius: f32,
+    pad: f32,
 };
 
 struct Scissors {
@@ -614,7 +621,7 @@ fn scissor_mask(scissor: Scissor, p: vec2<f32>) -> f32 {
     let pp = (M * vec3<f32>(p, 1.0)).xy;
     let center = scissor.origin + 0.5 * scissor.size;
     let size = scissor.size;
-    if sdBox(pp - center, 0.5 * size, 0.0) < 0.0 {
+    if sdBox(pp - center, 0.5 * size, scissor.radius) < 0.0 {
         return 1.0;
     } else {
         return 0.0;
@@ -623,19 +630,20 @@ fn scissor_mask(scissor: Scissor, p: vec2<f32>) -> f32 {
 
 @group(1)
 @binding(1)
-var glyph_atlas: texture_2d<f32>;
-
-@group(1)
-@binding(2)
-var color_atlas: texture_2d<f32>;
-
-@group(1)
-@binding(3)
 var samp : sampler;
 
 @group(1)
-@binding(4)
+@binding(2)
 var color_samp : sampler;
+
+@group(2)
+@binding(0)
+var glyph_atlas: texture_2d<f32>;
+
+@group(2)
+@binding(1)
+var color_atlas: texture_2d<f32>;
+
 
 // sRGB to linear conversion for one channel.
 fn toLinear(s: f32) -> f32
@@ -644,6 +652,27 @@ fn toLinear(s: f32) -> f32
         return s/12.92;
     }
     return pow((s + 0.055)/1.055, 2.4);
+}
+
+// This approximates the error function, needed for the gaussian integral
+fn erf(x: vec2<f32>) -> vec2<f32> {
+    let s = sign(x);
+    let a = abs(x);
+    var y = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    y *= y;
+    return s - s / (y * y);
+}
+
+fn gaussian(x: f32, sigma: f32) -> f32 {
+  let pi: f32 = 3.141592653589793;
+  return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * pi) * sigma);
+}
+
+fn roundedBoxShadowX(x: f32, y: f32, sigma: f32, corner: f32, halfSize: vec2<f32>) -> f32 {
+    let delta = min(halfSize.y - corner - abs(y), 0.0);
+    let curved = halfSize.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+    let integral = 0.5 + 0.5 * erf((x + vec2(-curved, curved)) * (sqrt(0.5) / sigma));
+    return integral.y - integral.x;
 }
 
 @fragment
@@ -659,10 +688,38 @@ fn fs_main(
     // Look up glyph alpha (if not a glyph, still have to because of wgsl).
     // let a = textureSample(glyph_atlas, samp, (in.t+0.5)/1024.0).r;
     // let mask = textureLoad(glyph_atlas, vec2<i32>(in.t), 0);
-    let mask = textureSample(glyph_atlas, samp, in.t/4096.0);
-    let color_mask = textureSample(color_atlas, color_samp, in.t/4096.0);
+    let mask = textureSample(glyph_atlas, samp, in.t/in.size);
+    let color_mask = textureSample(color_atlas, color_samp, in.t/in.size);
+
+    // Look up image color (if no active image, still have to because of wgsl).
+    // Note that we could use a separate shader if that's a perf hit.
+    let t = unpack_mat3x2(paint.xform) * vec3<f32>(in.t, 1.0);
+    var color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 
     let s = scissor_mask(scissor, in.p);
+    
+    if(prim.prim_type == 2u && prim.cv2.x > 0.0) {
+        let p = in.t;
+        let blur_radius = prim.cv2.x;
+        let center = 0.5*(prim.cv1 + prim.cv0);
+        let half_size = 0.5*(prim.cv1 - prim.cv0);
+        let point = p - center;
+        
+        let low = point.y - half_size.y;
+        let high = point.y + half_size.y;
+        let start = clamp(-3.0 * blur_radius, low, high);
+        let end = clamp(3.0 * blur_radius, low, high);
+        
+        let step = (end - start) / 4.0;
+        var y = start + step * 0.5;
+        var value = 0.0;
+        for (var i: i32 = 0; i < 4; i++) {
+            value += roundedBoxShadowX(point.x, point.y - y, blur_radius, prim.radius, half_size) * gaussian(y, blur_radius) * step;
+            y += step;
+        }
+        
+        return s * vec4<f32>(paint.inner_color.rgb, value * paint.inner_color.a);
+    }
 
     if(prim.prim_type == 8u) { // vgerGlyph
         if (mask.r <= 0.0) {
@@ -713,7 +770,9 @@ fn fs_main(
     }
 
     let d = sdPrim(prim, in.t, fw);
-    let color = apply(paint, in.t);
+    if paint.image == -1 {
+        color = apply(paint, in.t);
+    }
 
     return s * mix(vec4<f32>(color.rgb,0.0), color, 1.0-smoothstep(-fw/2.0,fw/2.0,d) );
 }
